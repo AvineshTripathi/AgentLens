@@ -1,0 +1,33 @@
+# Binaries
+agentlens
+bin/
+*.exe
+*.out
+
+# Go toolchain
+*.test
+*.prof
+vendor/
+
+# IDE & OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Env & secrets
+.env
+*.env
+
+# Test artifacts / temp scripts (root-level only)
+/test_*.py
+/test_*.go
+/mock_*.go
+/demo_*.go
+*.log
+
+# Python
+__pycache__/
+*.pyc
+examples/venv/
+tests/venv/

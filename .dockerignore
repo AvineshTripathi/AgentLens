@@ -1,0 +1,5 @@
+bin/
+.git/
+deployments/
+*.log
+.DS_Store

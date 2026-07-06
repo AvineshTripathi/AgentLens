@@ -1,0 +1,93 @@
+version: "3.9"
+
+services:
+  # ── AgentLens ──────────────────────────────────────────────────────────
+  agentlens:
+    build: .
+    ports:
+      - "8080:8080"   # Proxy gateway
+      - "8090:8090"   # Dashboard UI
+    environment:
+      AGENTLENS_POSTGRES_DSN: "postgres://agentlens:agentlens@postgres:5432/agentlens?sslmode=disable"
+      AGENTLENS_OTLP_ENDPOINT: "http://otel-collector:4318"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks: [agentlens]
+    restart: unless-stopped
+
+  # ── PostgreSQL ─────────────────────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: agentlens
+      POSTGRES_PASSWORD: agentlens
+      POSTGRES_DB: agentlens
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./internal/store/migrations:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U agentlens"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks: [agentlens]
+
+  # ── Prometheus ─────────────────────────────────────────────────────────
+  prometheus:
+    image: prom/prometheus:latest
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.retention.time=7d"
+    volumes:
+      - ./deployments/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - promdata:/prometheus
+    ports:
+      - "9090:9090"
+    networks: [agentlens]
+
+  # ── Grafana ────────────────────────────────────────────────────────────
+  grafana:
+    image: grafana/grafana:latest
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+    volumes:
+      - grafdata:/var/lib/grafana
+      - ./deployments/grafana/provisioning:/etc/grafana/provisioning:ro
+    ports:
+      - "3000:3000"
+    depends_on: [prometheus]
+    networks: [agentlens]
+
+  # ── OpenTelemetry Collector ────────────────────────────────────────────
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:latest
+    command: ["--config=/etc/otel/config.yaml"]
+    volumes:
+      - ./deployments/otel-collector.yaml:/etc/otel/config.yaml:ro
+    ports:
+      - "4318:4318"   # OTLP HTTP
+      - "4317:4317"   # OTLP gRPC
+    networks: [agentlens]
+
+  # ── Jaeger (trace visualization) ───────────────────────────────────────
+  jaeger:
+    image: jaegertracing/all-in-one:latest
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+    ports:
+      - "16686:16686"  # Jaeger UI
+      - "14268:14268"  # HTTP collector
+    networks: [agentlens]
+
+volumes:
+  pgdata:
+  promdata:
+  grafdata:
+
+networks:
+  agentlens:
+    driver: bridge

@@ -1,0 +1,15 @@
+server:
+  gateway_port: 8080      # Proxy intercepts LLM calls here
+  dashboard_port: 8090    # Dashboard UI + REST API + /metrics
+
+storage:
+  postgres_dsn: "postgres://agentlens:agentlens@localhost:5432/agentlens?sslmode=disable"
+
+proxy:
+  anthropic_upstream: "https://api.anthropic.com"
+  openai_upstream: "https://api.openai.com"
+  gemini_upstream: "https://generativelanguage.googleapis.com"
+
+telemetry:
+  otlp_endpoint: "http://localhost:4318"   # Jaeger / any OTLP collector
+  prometheus_port: 9091

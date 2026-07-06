@@ -1,0 +1,14 @@
+FROM golang:alpine AS builder
+WORKDIR /app
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+RUN CGO_ENABLED=0 GOOS=linux go build -o agentlens ./cmd/agentlens
+
+FROM alpine:3.21
+RUN apk add --no-cache ca-certificates tzdata
+WORKDIR /app
+COPY --from=builder /app/agentlens .
+COPY config.yaml .
+EXPOSE 8080 8090
+ENTRYPOINT ["./agentlens"]
