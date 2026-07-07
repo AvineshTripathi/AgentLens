@@ -6,6 +6,7 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
+	"flag"
 	"fmt"
 	"log"
 	"math/big"
@@ -15,6 +16,9 @@ import (
 )
 
 func main() {
+	force := flag.Bool("force", false, "Force regeneration of CA certificates")
+	flag.Parse()
+
 	homeDir, err := os.UserHomeDir()
 	if err != nil {
 		log.Fatalf("Failed to get home dir: %v", err)
@@ -28,10 +32,13 @@ func main() {
 	caCertPath := filepath.Join(caDir, "ca.crt")
 	caKeyPath := filepath.Join(caDir, "ca.key")
 
-	if _, err := os.Stat(caCertPath); err == nil {
-		if _, err := os.Stat(caKeyPath); err == nil {
-			fmt.Printf("CA already exists at %s\n", caDir)
-			return
+	if !*force {
+		if _, err := os.Stat(caCertPath); err == nil {
+			if _, err := os.Stat(caKeyPath); err == nil {
+				fmt.Printf("CA already exists at %s\n", caDir)
+				fmt.Println("Use --force to regenerate them.")
+				return
+			}
 		}
 	}
 

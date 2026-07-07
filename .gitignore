@@ -1,5 +1,6 @@
 # Binaries
-agentlens
+/agentlens
+/agentlens-ca
 agentlens_test
 bin/
 *.exe

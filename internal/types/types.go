@@ -70,19 +70,19 @@ type Session struct {
 // It contains the user message, model response, all tool calls made,
 // and computed signals (frustration, hallucination risk).
 type Turn struct {
-	ID               string     `json:"id"`
-	SessionID        string     `json:"session_id"`
-	Index            int        `json:"index"`
-	UserMessage      string     `json:"user_message"`
-	ModelResponse    string     `json:"model_response"`
-	ThinkingTrace    string     `json:"thinking_trace,omitempty"` // CoT if available
-	TokensIn         int        `json:"tokens_in"`
-	TokensOut        int        `json:"tokens_out"`
-	LatencyMs        int        `json:"latency_ms"`
-	FrustrationDelta float64    `json:"frustration_delta"` // change from previous turn
-	HallucinationRisk float64   `json:"hallucination_risk"`
-	ToolCalls        []ToolCall `json:"tool_calls,omitempty"`
-	CreatedAt        time.Time  `json:"created_at"`
+	ID                string     `json:"id"`
+	SessionID         string     `json:"session_id"`
+	Index             int        `json:"index"`
+	UserMessage       string     `json:"user_message"`
+	ModelResponse     string     `json:"model_response"`
+	ThinkingTrace     string     `json:"thinking_trace,omitempty"` // CoT if available
+	TokensIn          int        `json:"tokens_in"`
+	TokensOut         int        `json:"tokens_out"`
+	LatencyMs         int        `json:"latency_ms"`
+	FrustrationDelta  float64    `json:"frustration_delta"` // change from previous turn
+	HallucinationRisk float64    `json:"hallucination_risk"`
+	ToolCalls         []ToolCall `json:"tool_calls,omitempty"`
+	CreatedAt         time.Time  `json:"created_at"`
 }
 
 // ─── Tool Call ─────────────────────────────────────────────────────────────
@@ -158,7 +158,7 @@ type FrustrationTrigger string
 
 const (
 	TriggerRepeatedQuestion   FrustrationTrigger = "repeated_question"
-	TriggerRagePrompting      FrustrationTrigger = "rage_prompting"   // very fast repeated messages
+	TriggerRagePrompting      FrustrationTrigger = "rage_prompting" // very fast repeated messages
 	TriggerNegativeSentiment  FrustrationTrigger = "negative_sentiment"
 	TriggerExplicitCorrection FrustrationTrigger = "explicit_correction"
 	TriggerAbandonmentSignal  FrustrationTrigger = "abandonment_signal"
@@ -193,7 +193,7 @@ const (
 // that may have contributed to poor agent output.
 type InfraEvent struct {
 	ID         string         `json:"id"`
-	Service    string         `json:"service"`   // "postgres", "redis", "openai-api"
+	Service    string         `json:"service"` // "postgres", "redis", "openai-api"
 	EventType  InfraEventType `json:"event_type"`
 	DurationMs int            `json:"duration_ms,omitempty"`
 	ErrorMsg   string         `json:"error_msg,omitempty"`
@@ -213,19 +213,19 @@ type InfraCorrelation struct {
 
 // AgentHealth is an aggregated health snapshot for a given time window.
 type AgentHealth struct {
-	AgentID              string    `json:"agent_id"`
-	WindowStart          time.Time `json:"window_start"`
-	WindowEnd            time.Time `json:"window_end"`
-	TotalSessions        int       `json:"total_sessions"`
-	SuccessfulSessions   int       `json:"successful_sessions"`
-	AbandonedSessions    int       `json:"abandoned_sessions"`
-	SuccessRate          float64   `json:"success_rate"`
-	AvgFrustrationScore  float64   `json:"avg_frustration_score"`
-	HallucinationRate    float64   `json:"hallucination_rate"` // pct of turns flagged
-	AvgSessionTurns      float64   `json:"avg_session_turns"`
-	AvgLatencyMs         float64   `json:"avg_latency_ms"`
-	FrustrationEvents    int       `json:"frustration_events"`
-	InfraCorrelations    int       `json:"infra_correlations"`
+	AgentID             string    `json:"agent_id"`
+	WindowStart         time.Time `json:"window_start"`
+	WindowEnd           time.Time `json:"window_end"`
+	TotalSessions       int       `json:"total_sessions"`
+	SuccessfulSessions  int       `json:"successful_sessions"`
+	AbandonedSessions   int       `json:"abandoned_sessions"`
+	SuccessRate         float64   `json:"success_rate"`
+	AvgFrustrationScore float64   `json:"avg_frustration_score"`
+	HallucinationRate   float64   `json:"hallucination_rate"` // pct of turns flagged
+	AvgSessionTurns     float64   `json:"avg_session_turns"`
+	AvgLatencyMs        float64   `json:"avg_latency_ms"`
+	FrustrationEvents   int       `json:"frustration_events"`
+	InfraCorrelations   int       `json:"infra_correlations"`
 }
 
 // ─── Proxy Request/Response ───────────────────────────────────────────────

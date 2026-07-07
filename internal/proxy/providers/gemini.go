@@ -66,7 +66,7 @@ func (a *GeminiAdapter) ExtractSessionID(body []byte) string {
 			}
 		}
 	}
-	
+
 	if found && len(contents) > 0 {
 		// Use the first user message as the anchor for the session ID
 		for _, c := range contents {
@@ -178,7 +178,7 @@ func (a *GeminiAdapter) ExtractModel(body []byte, path string) string {
 			return strings.Split(parts[1], ":")[0]
 		}
 	}
-	
+
 	// Fallback to reading from the body for AGY/internal endpoints
 	var obj map[string]json.RawMessage
 	if err := json.Unmarshal(body, &obj); err == nil {
@@ -190,7 +190,7 @@ func (a *GeminiAdapter) ExtractModel(body []byte, path string) string {
 			}
 			return ""
 		}
-		
+
 		if raw, ok := obj["model"]; ok {
 			if m := extractStr(raw); m != "" {
 				return m
