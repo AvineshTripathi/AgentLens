@@ -41,8 +41,8 @@ To use AgentLens with your CLI agents, you can route all traffic through the pro
 ```bash
 export HTTP_PROXY="http://localhost:8080"
 export HTTPS_PROXY="http://localhost:8080"
-export NODE_EXTRA_CA_CERTS="/Users/avinesh/.agentlens/ca.crt"
-export REQUESTS_CA_BUNDLE="/Users/avinesh/.agentlens/ca.crt"
+export NODE_EXTRA_CA_CERTS="$HOME/.agentlens/ca.crt"
+export REQUESTS_CA_BUNDLE="$HOME/.agentlens/ca.crt"
 
 # Now run your agent normally!
 claude
