@@ -21,9 +21,9 @@ AgentLens natively supports:
 You can run the entire AgentLens stack locally using Docker Compose.
 
 ### 1. Start the stack
-Run the following command in the root of the project:
+Run the following command in the root of the project to build the proxy, generate local CA certificates, and start all services via Docker:
 ```bash
-docker compose up -d
+make deploy
 ```
 This will start:
 - **AgentLens Gateway:** `http://localhost:8080`
@@ -56,3 +56,14 @@ AgentLens intercepts traffic asynchronously to prevent adding latency to the use
 2. The Gateway computes a session ID (via headers or payload hashing) and forwards the request to the real LLM provider.
 3. The response is buffered and sent back to the CLI immediately.
 4. Asynchronously, the Gateway parses the buffered payload, extracts token usage, tool calls, and text, and persists it to PostgreSQL.
+
+## Configuration
+
+You can configure the upstream LLM endpoints by editing the `config.yaml` file located in the root directory. For example, to change your Gemini endpoint:
+
+```yaml
+proxy:
+  gemini_upstream: "https://your-custom-endpoint.com"
+```
+
+After modifying the file, simply run `make deploy` again to rebuild the image and apply the changes.
