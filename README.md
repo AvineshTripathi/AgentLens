@@ -56,6 +56,3 @@ AgentLens intercepts traffic asynchronously to prevent adding latency to the use
 2. The Gateway computes a session ID (via headers or payload hashing) and forwards the request to the real LLM provider.
 3. The response is buffered and sent back to the CLI immediately.
 4. Asynchronously, the Gateway parses the buffered payload, extracts token usage, tool calls, and text, and persists it to PostgreSQL.
-5. Background Python workers scan the database for complex patterns (e.g., hallucination heuristics).
-
-For a deep dive into the system's design, see `architecture.md` (internal).
