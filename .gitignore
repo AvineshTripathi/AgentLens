@@ -1,5 +1,6 @@
 # Binaries
 agentlens
+agentlens_test
 bin/
 *.exe
 *.out
@@ -19,15 +20,26 @@ vendor/
 .env
 *.env
 
-# Test artifacts / temp scripts (root-level only)
+# Test artifacts / temp scripts
 /test_*.py
 /test_*.go
 /mock_*.go
 /demo_*.go
+/patch_*.py
+/patch.py
 *.log
 
 # Python
 __pycache__/
 *.pyc
 examples/venv/
+tests/.venv/
 tests/venv/
+tests/e2e/__pycache__/
+
+# CA keys (generated locally, never commit)
+*.crt
+*.key
+
+# Docs (Internal)
+architecture.md

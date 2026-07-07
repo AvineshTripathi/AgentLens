@@ -122,7 +122,7 @@ type TimelineEntry struct {
 func (s *Server) getTimeline(w http.ResponseWriter, r *http.Request) {
 	id := mux.Vars(r)["id"]
 
-	turns, err := s.store.ListTurns(r.Context(), id)
+	turns, err := s.store.ListTimelineTurns(r.Context(), id)
 	if err != nil {
 		jsonError(w, err, http.StatusInternalServerError)
 		return

@@ -108,7 +108,9 @@ func (s *Store) ListSessions(ctx context.Context, limit int) ([]*types.Session, 
 		        started_at, ended_at, outcome,
 		        turn_count, total_tokens_in, total_tokens_out,
 		        frustration_score, metadata
-		 FROM sessions ORDER BY started_at DESC LIMIT $1`, limit)
+		 FROM sessions
+		 ORDER BY (SELECT COALESCE(MAX(created_at), sessions.started_at) FROM turns WHERE turns.session_id = sessions.id) DESC
+		 LIMIT $1`, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -163,11 +165,62 @@ func (s *Store) InsertTurn(ctx context.Context, t *types.Turn) error {
 	return err
 }
 
+// UpdateTurn updates an existing conversation turn (used for aggregating tool loops).
+func (s *Store) UpdateTurn(ctx context.Context, t *types.Turn) error {
+	_, err := s.db.ExecContext(ctx, `
+		UPDATE turns SET
+			model_response = $1,
+			tokens_in = $2,
+			tokens_out = $3,
+			latency_ms = $4,
+			frustration_delta = $5,
+			hallucination_risk = $6
+		WHERE id = $7`,
+		t.ModelResponse,
+		t.TokensIn, t.TokensOut, t.LatencyMs,
+		t.FrustrationDelta, t.HallucinationRisk,
+		t.ID,
+	)
+	return err
+}
+
 // ListTurns returns all turns for a session, in order.
 func (s *Store) ListTurns(ctx context.Context, sessionID string) ([]*types.Turn, error) {
 	rows, err := s.db.QueryContext(ctx,
 		`SELECT id, session_id, turn_index,
 		        user_message, model_response, thinking_trace,
+		        tokens_in, tokens_out, latency_ms,
+		        frustration_delta, hallucination_risk, created_at
+		 FROM turns WHERE session_id = $1 ORDER BY turn_index ASC`, sessionID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var turns []*types.Turn
+	for rows.Next() {
+		var t types.Turn
+		if err := rows.Scan(
+			&t.ID, &t.SessionID, &t.Index,
+			&t.UserMessage, &t.ModelResponse, &t.ThinkingTrace,
+			&t.TokensIn, &t.TokensOut, &t.LatencyMs,
+			&t.FrustrationDelta, &t.HallucinationRisk, &t.CreatedAt,
+		); err != nil {
+			return nil, err
+		}
+		turns = append(turns, &t)
+	}
+	return turns, rows.Err()
+}
+
+// ListTimelineTurns returns turns with user and model messages heavily truncated
+// to drastically reduce JSON payload size and browser rendering overhead for the timeline view.
+func (s *Store) ListTimelineTurns(ctx context.Context, sessionID string) ([]*types.Turn, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT id, session_id, turn_index,
+		        LEFT(user_message, 250) AS user_message, 
+		        LEFT(model_response, 250) AS model_response, 
+		        thinking_trace,
 		        tokens_in, tokens_out, latency_ms,
 		        frustration_delta, hallucination_risk, created_at
 		 FROM turns WHERE session_id = $1 ORDER BY turn_index ASC`, sessionID)

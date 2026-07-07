@@ -5,6 +5,8 @@ package proxy
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -12,54 +14,127 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"os"
+	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/elazarl/goproxy"
 	"github.com/google/uuid"
 	"github.com/gorilla/mux"
 
 	"github.com/AvineshTripathi/AgentLens/internal/config"
 	"github.com/AvineshTripathi/AgentLens/internal/intelligence"
 	"github.com/AvineshTripathi/AgentLens/internal/metrics"
+	"github.com/AvineshTripathi/AgentLens/internal/proxy/providers"
 	"github.com/AvineshTripathi/AgentLens/internal/store"
 	"github.com/AvineshTripathi/AgentLens/internal/types"
 )
 
 // ─── Session Manager ──────────────────────────────────────────────────────
 
+// sessionTTL is how long a session is eligible for continuation after its
+// last turn.  Requests arriving after this window are treated as a new session
+// even if the first-message hash matches an older one.
+const sessionTTL = 4 * time.Hour
+
 // SessionManager keeps in-memory session state for fast access during
 // a live session, persisting to PostgreSQL asynchronously.
+//
+// Two-level session index:
+//   - sessions:   primary map — session_id → *sessionState
+//   - rootIndex:  secondary map — anchor_hash → session_id
+//     (anchor_hash == the value returned by adapter.ExtractSessionID)
+//
+// The rootIndex lets the manager coalesce all turns of the same conversation
+// into one session even when the request body drifts slightly between turns
+// (e.g. Claude CLI injects dynamic git-status into the first message).
 type SessionManager struct {
-	mu       sync.RWMutex
-	sessions map[string]*sessionState
-	store    *store.Store
+	mu        sync.RWMutex
+	sessions  map[string]*sessionState
+	rootIndex map[string]string // anchor_hash → session_id
+	store     *store.Store
 }
 
 type sessionState struct {
 	session        *types.Session
 	turns          []*types.Turn
 	lastTurnAt     *time.Time
+	lastActiveAt   time.Time
 	recentMessages []string // last 3 user messages for repeat detection
 }
 
 // NewSessionManager creates a session manager backed by the given store.
 func NewSessionManager(st *store.Store) *SessionManager {
 	return &SessionManager{
-		sessions: make(map[string]*sessionState),
-		store:    st,
+		sessions:  make(map[string]*sessionState),
+		rootIndex: make(map[string]string),
+		store:     st,
 	}
 }
 
 // GetOrCreate returns an existing session state or creates a new one.
-func (sm *SessionManager) GetOrCreate(sessionID, agentID string, provider types.Provider, model string) *sessionState {
+//
+// anchorHash (same value as sessionID for stateless providers) is stored in
+// rootIndex so that subsequent turns of the same conversation — even if the
+// computed hash drifts by a few characters — still resolve to the original
+// session as long as it is within sessionTTL.
+// GetOrCreate resolves a session using a three-level lookup:
+//
+//  1. Exact sessionID match (fastest path, O(1)).
+//  2. continuationID match — the stable hash of the first assistant response,
+//     used as a fallback when the first-message hash drifts between turns
+//     (e.g. Claude CLI injects dynamic context into messages[0]).
+//  3. rootIndex anchor match — handles minor hash variation for the same anchor.
+//
+// If none match, a new session is created and both sessionID and continuationID
+// are registered in the rootIndex for future lookups.
+func (sm *SessionManager) GetOrCreate(sessionID, continuationID, agentID string, provider types.Provider, model string) *sessionState {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
 
+	// ── Level-1: exact session ID ─────────────────────────────────────────
 	if state, ok := sm.sessions[sessionID]; ok {
+		state.lastActiveAt = time.Now()
 		return state
 	}
 
+	// ── Level-2: continuationID — first assistant response hash ──────────
+	// messages[1] in subsequent requests is the first assistant reply,
+	// sent verbatim by the client. Its hash is perfectly stable across all
+	// turns of the same conversation.
+	if continuationID != "" {
+		if existingID, ok := sm.rootIndex[continuationID]; ok {
+			if state, ok2 := sm.sessions[existingID]; ok2 {
+				if time.Since(state.lastActiveAt) < sessionTTL {
+					sm.sessions[sessionID] = state // alias so level-1 hits next time
+					state.lastActiveAt = time.Now()
+					slog.Debug("session: continued via continuationID",
+						"cont_id", continuationID, "resolved_to", existingID)
+					return state
+				}
+				delete(sm.rootIndex, continuationID)
+			}
+		}
+	}
+
+	// ── Level-3: rootIndex anchor (handles minor hash drift on sessionID) ─
+	if existingID, ok := sm.rootIndex[sessionID]; ok {
+		if state, ok2 := sm.sessions[existingID]; ok2 {
+			if time.Since(state.lastActiveAt) < sessionTTL {
+				sm.sessions[sessionID] = state
+				state.lastActiveAt = time.Now()
+				slog.Debug("session: continued via rootIndex",
+					"anchor", sessionID, "resolved_to", existingID)
+				return state
+			}
+			delete(sm.rootIndex, sessionID)
+		}
+	}
+
+	// ── Create new session ───────────────────────────────────────────────
 	sess := &types.Session{
 		ID:        sessionID,
 		AgentID:   agentID,
@@ -68,13 +143,18 @@ func (sm *SessionManager) GetOrCreate(sessionID, agentID string, provider types.
 		StartedAt: time.Now(),
 		Outcome:   types.OutcomeInProgress,
 	}
-
-	state := &sessionState{session: sess}
+	state := &sessionState{
+		session:      sess,
+		lastActiveAt: time.Now(),
+	}
 	sm.sessions[sessionID] = state
+	sm.rootIndex[sessionID] = sessionID
+	if continuationID != "" {
+		sm.rootIndex[continuationID] = sessionID
+	}
 	metrics.ActiveSessions.WithLabelValues(string(provider)).Inc()
 	metrics.SessionsTotal.WithLabelValues(string(provider), agentID).Inc()
 
-	// Persist session start.
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
@@ -86,7 +166,9 @@ func (sm *SessionManager) GetOrCreate(sessionID, agentID string, provider types.
 	return state
 }
 
-// RecordTurn adds a turn to the session and persists it.
+// RecordTurn adds a turn to the session, persists it, and registers the model
+// response as a continuation key so the NEXT request can find this session via
+// the assistant-response hash (level-2 lookup in GetOrCreate).
 func (sm *SessionManager) RecordTurn(state *sessionState, turn *types.Turn) {
 	sm.mu.Lock()
 	now := turn.CreatedAt
@@ -101,6 +183,19 @@ func (sm *SessionManager) RecordTurn(state *sessionState, turn *types.Turn) {
 		state.recentMessages = state.recentMessages[1:]
 	}
 	state.turns = append(state.turns, turn)
+
+	// Register the combined user+assistant hash as a continuation key.
+	// On the NEXT request the client will resend both messages verbatim,
+	// so ExtractContinuationID can recompute the same key and find this session.
+	if turn.ModelResponse != "" && turn.UserMessage != "" {
+		respKey := turn.ModelResponse
+		if len(respKey) > 200 {
+			respKey = respKey[:200]
+		}
+		combined := "conv:" + turn.UserMessage + "|" + respKey
+		continuationKey := uuid.NewMD5(uuid.NameSpaceOID, []byte(combined)).String()
+		sm.rootIndex[continuationKey] = state.session.ID
+	}
 	sm.mu.Unlock()
 
 	go func() {
@@ -127,7 +222,9 @@ type Gateway struct {
 	traceBldr  *intelligence.DecisionTraceBuilder
 	store      *store.Store
 	router     *mux.Router
+	forward    *goproxy.ProxyHttpServer
 	proxyCfg   config.ProxyConfig
+	registry   *providers.Registry
 }
 
 // NewGateway assembles the gateway with all dependencies wired up.
@@ -140,14 +237,21 @@ func NewGateway(st *store.Store, proxyCfg config.ProxyConfig) *Gateway {
 		traceBldr:  intelligence.NewDecisionTraceBuilder(),
 		store:      st,
 		router:     mux.NewRouter(),
+		forward:    goproxy.NewProxyHttpServer(),
 		proxyCfg:   proxyCfg,
+		registry:   providers.DefaultRegistry(),
 	}
 	g.routes()
+	g.setupForwardProxy()
 	return g
 }
 
 // ServeHTTP implements http.Handler.
 func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodConnect || r.URL.IsAbs() {
+		g.forward.ServeHTTP(w, r)
+		return
+	}
 	g.router.ServeHTTP(w, r)
 }
 
@@ -167,6 +271,230 @@ func (g *Gateway) routes() {
 	g.router.HandleFunc("/sessions/{id}/close", g.handleSessionClose).Methods(http.MethodPost)
 }
 
+func (g *Gateway) setupForwardProxy() {
+	g.forward.Verbose = true
+
+	// Attempt to load local CA
+	homeDir, err := os.UserHomeDir()
+	if err == nil {
+		caCertPath := filepath.Join(homeDir, ".agentlens", "ca.crt")
+		caKeyPath := filepath.Join(homeDir, ".agentlens", "ca.key")
+		caCert, err1 := os.ReadFile(caCertPath)
+		caKey, err2 := os.ReadFile(caKeyPath)
+		if err1 == nil && err2 == nil {
+			if tlsc, err := tls.X509KeyPair(caCert, caKey); err == nil {
+				if tlsc.Leaf, err = x509.ParseCertificate(tlsc.Certificate[0]); err == nil {
+					goproxy.GoproxyCa = tlsc
+					goproxy.OkConnect = &goproxy.ConnectAction{Action: goproxy.ConnectAccept, TLSConfig: goproxy.TLSConfigFromCA(&tlsc)}
+					goproxy.MitmConnect = &goproxy.ConnectAction{Action: goproxy.ConnectMitm, TLSConfig: goproxy.TLSConfigFromCA(&tlsc)}
+					goproxy.HTTPMitmConnect = &goproxy.ConnectAction{Action: goproxy.ConnectHTTPMitm, TLSConfig: goproxy.TLSConfigFromCA(&tlsc)}
+					goproxy.RejectConnect = &goproxy.ConnectAction{Action: goproxy.ConnectReject, TLSConfig: goproxy.TLSConfigFromCA(&tlsc)}
+					slog.Info("Loaded AgentLens Root CA for MITM interception")
+				}
+			}
+		} else {
+			slog.Warn("AgentLens Root CA not found. MITM interception will not work. Run cmd/agentlens-ca to generate it.")
+		}
+	}
+
+	// Always MITM all registered provider domains — built automatically from the registry.
+	g.forward.OnRequest(goproxy.ReqHostMatches(regexp.MustCompile(g.registry.MITMRegex()))).HandleConnect(goproxy.AlwaysMitm)
+
+	// Route intercepted traffic through our pipeline
+	g.forward.OnRequest().DoFunc(func(req *http.Request, ctx *goproxy.ProxyCtx) (*http.Request, *http.Response) {
+		host := req.URL.Hostname()
+		path := req.URL.Path
+
+		// Look up the right adapter by path first, then host.
+		adapter := g.registry.Find(host, path)
+		if adapter == nil {
+			return req, nil
+		}
+
+		g.handleInterceptedRequest(req, ctx, adapter)
+		return req, nil
+	})
+
+	g.forward.OnResponse().DoFunc(func(resp *http.Response, ctx *goproxy.ProxyCtx) *http.Response {
+		if ctx.UserData != nil {
+			g.handleInterceptedResponse(resp, ctx)
+		}
+		return resp
+	})
+}
+
+type proxyState struct {
+	state       *sessionState
+	adapter     providers.Adapter
+	model       string
+	userMessage string
+	start       time.Time
+}
+
+func (g *Gateway) handleInterceptedRequest(req *http.Request, ctx *goproxy.ProxyCtx, adapter providers.Adapter) {
+	if req.Body == nil {
+		return
+	}
+	bodyBytes, err := io.ReadAll(io.LimitReader(req.Body, 2<<20))
+	if err == nil {
+		req.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+	}
+
+	// Drop internal housekeeping requests (like Claude Code title generation)
+	// before they pollute the session tracking system.
+	if sa, ok := adapter.(interface{ ShouldSkip([]byte) bool }); ok {
+		if sa.ShouldSkip(bodyBytes) {
+			slog.Debug("gateway: skipping MITM internal request", "host", req.URL.Hostname())
+			return
+		}
+	}
+
+	sessionID := req.Header.Get("X-AgentLens-Session-ID")
+	if sessionID == "" {
+		sessionID = req.Header.Get("X-Claude-Code-Session-Id")
+	}
+	if sessionID == "" {
+		sessionID = adapter.ExtractSessionID(bodyBytes)
+		if sessionID == "" {
+			sessionID = uuid.NewString()
+		}
+	}
+	agentID := req.Header.Get("X-AgentLens-Agent-ID")
+	if agentID == "" {
+		agentID = "unknown"
+	}
+
+	userMessage := req.Header.Get("X-AgentLens-User-Message")
+	if userMessage == "" {
+		userMessage = adapter.ExtractUserMessage(bodyBytes)
+	}
+
+	model := adapter.ExtractModel(bodyBytes, req.URL.Path)
+
+	// Extract a stable continuation ID from the request if the adapter supports it.
+	// This is the hash of the first assistant response (messages[1]) which the
+	// client resends verbatim on every turn — immune to dynamic context injection.
+	continuationID := ""
+	if ca, ok := adapter.(interface{ ExtractContinuationID([]byte) string }); ok {
+		continuationID = ca.ExtractContinuationID(bodyBytes)
+	}
+	state := g.sessionMgr.GetOrCreate(sessionID, continuationID, agentID, adapter.Provider(), model)
+
+	ctx.UserData = &proxyState{
+		state:       state,
+		adapter:     adapter,
+		model:       model,
+		userMessage: userMessage,
+		start:       time.Now(),
+	}
+}
+
+func (g *Gateway) handleInterceptedResponse(resp *http.Response, ctx *goproxy.ProxyCtx) {
+	if resp == nil || resp.Body == nil {
+		return
+	}
+	pState, ok := ctx.UserData.(*proxyState)
+	if !ok {
+		return
+	}
+
+	bodyBytes, err := io.ReadAll(io.LimitReader(resp.Body, 5<<20)) // 5 MB limit
+	if err == nil {
+		resp.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+	}
+
+	latency := time.Since(pState.start)
+	modelResponse := pState.adapter.ExtractModelResponse(bodyBytes)
+	tokensIn, tokensOut := pState.adapter.ExtractTokenCounts(bodyBytes)
+	provider := pState.adapter.Provider()
+
+	// ── Duplicate Turn (Tool Loop) Detection ──────────────────────
+	var prevTurn *types.Turn
+	g.sessionMgr.mu.RLock()
+	if len(pState.state.turns) > 0 {
+		prevTurn = pState.state.turns[len(pState.state.turns)-1]
+	}
+	g.sessionMgr.mu.RUnlock()
+
+	isToolLoop := false
+	if prevTurn != nil && pState.userMessage != "" && pState.userMessage == prevTurn.UserMessage {
+		// If exact same user message within 30 seconds, it's almost certainly a tool loop step.
+		if time.Since(prevTurn.CreatedAt) < 30*time.Second {
+			isToolLoop = true
+		}
+	}
+
+	if isToolLoop {
+		// Update the previous turn instead of creating a new one
+		prevTurn.ModelResponse = modelResponse
+		prevTurn.TokensIn += tokensIn
+		prevTurn.TokensOut += tokensOut
+		prevTurn.LatencyMs += int(latency.Milliseconds())
+
+		// Persist update in background
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			if err := g.store.UpdateTurn(ctx, prevTurn); err != nil {
+				slog.Error("failed to update turn", "err", err)
+			}
+		}()
+		
+		slog.Info("tool loop turn aggregated", "session_id", pState.state.session.ID, "turn_id", prevTurn.ID)
+		return
+	}
+
+	// Build a new turn.
+	turnID := uuid.NewString()
+	turn := &types.Turn{
+		ID:            turnID,
+		SessionID:     pState.state.session.ID,
+		Index:         pState.state.session.TurnCount,
+		UserMessage:   pState.userMessage,
+		ModelResponse: modelResponse,
+		TokensIn:      tokensIn,
+		TokensOut:     tokensOut,
+		LatencyMs:     int(latency.Milliseconds()),
+		CreatedAt:     pState.start,
+	}
+
+	// 1. Frustration analysis
+	var prevTurnAt *time.Time
+	g.sessionMgr.mu.RLock()
+	prevTurnAt = pState.state.lastTurnAt
+	recentMsgs := append([]string{}, pState.state.recentMessages...)
+	prevFrustration := pState.state.session.FrustrationScore
+	g.sessionMgr.mu.RUnlock()
+
+	frustResult := g.frustAnal.Score(pState.userMessage, prevFrustration, prevTurnAt, recentMsgs)
+	turn.FrustrationDelta = frustResult.Delta
+	pState.state.session.FrustrationScore = frustResult.Score
+
+	// 2. Hallucination analysis
+	halSignals := g.hallucDet.Analyze(turn)
+	turn.HallucinationRisk = g.hallucDet.AggregateRisk(halSignals)
+
+	// 3. Emit metrics
+	metrics.TurnsTotal.WithLabelValues(string(provider), pState.model).Inc()
+	metrics.TurnLatencyMs.WithLabelValues(string(provider), pState.model).Observe(float64(latency.Milliseconds()))
+	metrics.TokensIn.WithLabelValues(string(provider), pState.model).Add(float64(tokensIn))
+	metrics.TokensOut.WithLabelValues(string(provider), pState.model).Add(float64(tokensOut))
+
+	if g.frustAnal.ShouldAlert(frustResult.Score) {
+		pState.state.session.Outcome = types.OutcomeAbandoned
+	}
+
+	// 4. Persist
+	g.sessionMgr.RecordTurn(pState.state, turn)
+
+	slog.Info("mitm turn processed",
+		"session_id", pState.state.session.ID,
+		"provider", provider,
+		"latency_ms", turn.LatencyMs,
+		"frustration", fmt.Sprintf("%.2f", frustResult.Score),
+	)
+}
+
 // ─── Model Proxy ──────────────────────────────────────────────────────────
 
 // handleModelProxy returns an HTTP handler that proxies requests to the
@@ -184,28 +512,66 @@ func (g *Gateway) handleModelProxy(upstreamBase string, provider types.Provider)
 		// Disable compression so we can intercept plain JSON response
 		r.Header.Del("Accept-Encoding")
 
+		// Resolve adapter: prefer path-based lookup, fall back to provider type.
+		adapter := g.registry.Find(r.Host, r.URL.Path)
+		if adapter == nil {
+			switch provider {
+			case types.ProviderAnthropic:
+				adapter = &providers.AnthropicAdapter{}
+			case types.ProviderOpenAI:
+				adapter = &providers.OpenAIAdapter{}
+			default:
+				adapter = &providers.GeminiAdapter{}
+			}
+		}
+
 		// Extract AgentLens metadata from headers.
+		
+		// Drop internal housekeeping requests (like Claude Code title generation)
+		// before they pollute the session tracking system.
+		if sa, ok := adapter.(interface{ ShouldSkip([]byte) bool }); ok {
+			if sa.ShouldSkip(bodyBytes) {
+				slog.Debug("gateway: skipping proxy internal request", "provider", provider)
+				target, _ := url.Parse(upstreamBase)
+				proxy := httputil.NewSingleHostReverseProxy(target)
+				r.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+				r.ContentLength = int64(len(bodyBytes))
+				r.TransferEncoding = nil
+				r.URL.Scheme = target.Scheme
+				r.URL.Host = target.Host
+				r.URL.Path = strings.TrimPrefix(r.URL.Path, "/proxy/"+strings.ToLower(string(provider)))
+				r.Host = target.Host
+				proxy.ServeHTTP(w, r)
+				return
+			}
+		}
+
 		sessionID := r.Header.Get("X-AgentLens-Session-ID")
 		if sessionID == "" {
-			sessionID = uuid.NewString()
+			sessionID = r.Header.Get("X-Claude-Code-Session-Id")
+		}
+		if sessionID == "" {
+			sessionID = adapter.ExtractSessionID(bodyBytes)
+			if sessionID == "" {
+				sessionID = uuid.NewString()
+			}
 		}
 		agentID := r.Header.Get("X-AgentLens-Agent-ID")
 		if agentID == "" {
 			agentID = "unknown"
 		}
 		userMessage := r.Header.Get("X-AgentLens-User-Message")
-		model := extractModelFromBody(bodyBytes)
-		if provider == types.ProviderGemini && model == "unknown" {
-			parts := strings.Split(r.URL.Path, "/")
-			for _, p := range parts {
-				if strings.Contains(p, "gemini-") || strings.Contains(p, "gemma-") {
-					model = strings.Split(p, ":")[0]
-					break
-				}
-			}
+		if userMessage == "" {
+			userMessage = adapter.ExtractUserMessage(bodyBytes)
 		}
 
-		state := g.sessionMgr.GetOrCreate(sessionID, agentID, provider, model)
+		model := adapter.ExtractModel(bodyBytes, r.URL.Path)
+
+		contID := ""
+		if ca, ok := adapter.(interface{ ExtractContinuationID([]byte) string }); ok {
+			contID = ca.ExtractContinuationID(bodyBytes)
+		}
+		state := g.sessionMgr.GetOrCreate(sessionID, contID, agentID, provider, model)
 
 		// Proxy the request upstream.
 		target, _ := url.Parse(upstreamBase)
@@ -228,8 +594,8 @@ func (g *Gateway) handleModelProxy(upstreamBase string, provider types.Provider)
 		latency := time.Since(start)
 
 		// Extract model response from captured body.
-		modelResponse := extractModelResponse(provider, rec.body.Bytes())
-		tokensIn, tokensOut := extractTokenCounts(provider, rec.body.Bytes())
+		modelResponse := adapter.ExtractModelResponse(rec.body.Bytes())
+		tokensIn, tokensOut := adapter.ExtractTokenCounts(rec.body.Bytes())
 
 		// Build the turn.
 		turnID := uuid.NewString()
@@ -563,116 +929,6 @@ func (r *responseRecorder) Flush() {
 func (r *responseRecorder) Unwrap() http.ResponseWriter {
 	return r.ResponseWriter
 }
-
-// extractModelFromBody tries to pull the model name from the request JSON body.
-func extractModelFromBody(body []byte) string {
-	var obj map[string]json.RawMessage
-	if err := json.Unmarshal(body, &obj); err != nil {
-		return "unknown"
-	}
-	if raw, ok := obj["model"]; ok {
-		var model string
-		if err := json.Unmarshal(raw, &model); err == nil {
-			return model
-		}
-	}
-	return "unknown"
-}
-
-// extractModelResponse pulls the text content from provider-specific response formats.
-func extractModelResponse(provider types.Provider, body []byte) string {
-	var obj map[string]json.RawMessage
-	if err := json.Unmarshal(body, &obj); err != nil {
-		return ""
-	}
-
-	switch provider {
-	case types.ProviderAnthropic:
-		// Anthropic: { "content": [{ "type": "text", "text": "..." }] }
-		if raw, ok := obj["content"]; ok {
-			var content []struct {
-				Type string `json:"type"`
-				Text string `json:"text"`
-			}
-			if err := json.Unmarshal(raw, &content); err == nil {
-				var sb strings.Builder
-				for _, c := range content {
-					if c.Type == "text" {
-						sb.WriteString(c.Text)
-					}
-				}
-				return sb.String()
-			}
-		}
-
-	case types.ProviderOpenAI:
-		// OpenAI: { "choices": [{ "message": { "content": "..." } }] }
-		if raw, ok := obj["choices"]; ok {
-			var choices []struct {
-				Message struct {
-					Content string `json:"content"`
-				} `json:"message"`
-			}
-			if err := json.Unmarshal(raw, &choices); err == nil && len(choices) > 0 {
-				return choices[0].Message.Content
-			}
-		}
-
-	case types.ProviderGemini:
-		if raw, ok := obj["candidates"]; ok {
-			var candidates []struct {
-				Content struct {
-					Parts []struct {
-						Text string `json:"text"`
-					} `json:"parts"`
-				} `json:"content"`
-			}
-			if err := json.Unmarshal(raw, &candidates); err == nil && len(candidates) > 0 {
-				var sb strings.Builder
-				for _, p := range candidates[0].Content.Parts {
-					sb.WriteString(p.Text)
-				}
-				return sb.String()
-			}
-		}
-	}
-	return ""
-}
-
-// extractTokenCounts pulls token usage from provider response bodies.
-func extractTokenCounts(provider types.Provider, body []byte) (in, out int) {
-	var obj map[string]json.RawMessage
-	if err := json.Unmarshal(body, &obj); err != nil {
-		return 0, 0
-	}
-
-	switch provider {
-	case types.ProviderAnthropic:
-		// { "usage": { "input_tokens": N, "output_tokens": N } }
-		if raw, ok := obj["usage"]; ok {
-			var usage struct {
-				InputTokens  int `json:"input_tokens"`
-				OutputTokens int `json:"output_tokens"`
-			}
-			if err := json.Unmarshal(raw, &usage); err == nil {
-				return usage.InputTokens, usage.OutputTokens
-			}
-		}
-	case types.ProviderOpenAI:
-		// { "usage": { "prompt_tokens": N, "completion_tokens": N } }
-		if raw, ok := obj["usage"]; ok {
-			var usage struct {
-				PromptTokens     int `json:"prompt_tokens"`
-				CompletionTokens int `json:"completion_tokens"`
-			}
-			if err := json.Unmarshal(raw, &usage); err == nil {
-				return usage.PromptTokens, usage.CompletionTokens
-			}
-		}
-	}
-	return 0, 0
-}
-
 // callUpstreamTool makes a POST request to the real tool server.
 func callUpstreamTool(upstreamURL string, params json.RawMessage) (json.RawMessage, error) {
 	resp, err := http.Post(upstreamURL, "application/json", bytes.NewReader(params))

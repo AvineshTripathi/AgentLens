@@ -13,6 +13,8 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+    volumes:
+      - ~/.agentlens:/root/.agentlens:ro
     networks: [agentlens]
     restart: unless-stopped
 
