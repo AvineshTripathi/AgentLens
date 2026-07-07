@@ -215,31 +215,36 @@ func (sm *SessionManager) RecordTurn(state *sessionState, turn *types.Turn) {
 // Gateway is the central HTTP proxy. It intercepts requests to LLM providers
 // and tool servers, runs the intelligence pipeline, and emits all signals.
 type Gateway struct {
-	sessionMgr *SessionManager
-	hallucDet  *intelligence.HallucinationDetector
-	frustAnal  *intelligence.FrustrationAnalyzer
-	infraCorr  *intelligence.InfraCorrelator
-	traceBldr  *intelligence.DecisionTraceBuilder
-	store      *store.Store
-	router     *mux.Router
-	forward    *goproxy.ProxyHttpServer
-	proxyCfg   config.ProxyConfig
-	registry   *providers.Registry
+	sessionMgr   *SessionManager
+	intelligence *intelligence.Registry
+	infraCorr    *intelligence.InfraCorrelator
+	traceBldr    *intelligence.DecisionTraceBuilder
+	store        *store.Store
+	router       *mux.Router
+	forward      *goproxy.ProxyHttpServer
+	proxyCfg     config.ProxyConfig
+	registry     *providers.Registry
+}
+
+func buildIntelligenceRegistry() *intelligence.Registry {
+	reg := intelligence.NewRegistry()
+	reg.Register(intelligence.NewHallucinationDetector())
+	reg.Register(intelligence.NewFrustrationAnalyzer())
+	return reg
 }
 
 // NewGateway assembles the gateway with all dependencies wired up.
 func NewGateway(st *store.Store, proxyCfg config.ProxyConfig) *Gateway {
 	g := &Gateway{
-		sessionMgr: NewSessionManager(st),
-		hallucDet:  intelligence.NewHallucinationDetector(),
-		frustAnal:  intelligence.NewFrustrationAnalyzer(),
-		infraCorr:  intelligence.NewInfraCorrelator(),
-		traceBldr:  intelligence.NewDecisionTraceBuilder(),
-		store:      st,
-		router:     mux.NewRouter(),
-		forward:    goproxy.NewProxyHttpServer(),
-		proxyCfg:   proxyCfg,
-		registry:   providers.DefaultRegistry(),
+		sessionMgr:   NewSessionManager(st),
+		intelligence: buildIntelligenceRegistry(),
+		infraCorr:    intelligence.NewInfraCorrelator(),
+		traceBldr:    intelligence.NewDecisionTraceBuilder(),
+		store:        st,
+		router:       mux.NewRouter(),
+		forward:      goproxy.NewProxyHttpServer(),
+		proxyCfg:     proxyCfg,
+		registry:     providers.DefaultRegistry(),
 	}
 	g.routes()
 	g.setupForwardProxy()
@@ -439,7 +444,7 @@ func (g *Gateway) handleInterceptedResponse(resp *http.Response, ctx *goproxy.Pr
 				slog.Error("failed to update turn", "err", err)
 			}
 		}()
-		
+
 		slog.Info("tool loop turn aggregated", "session_id", pState.state.session.ID, "turn_id", prevTurn.ID)
 		return
 	}
@@ -458,31 +463,27 @@ func (g *Gateway) handleInterceptedResponse(resp *http.Response, ctx *goproxy.Pr
 		CreatedAt:     pState.start,
 	}
 
-	// 1. Frustration analysis
+	// ── Run intelligence pipeline ──────────────────────────────────
 	var prevTurnAt *time.Time
 	g.sessionMgr.mu.RLock()
 	prevTurnAt = pState.state.lastTurnAt
 	recentMsgs := append([]string{}, pState.state.recentMessages...)
-	prevFrustration := pState.state.session.FrustrationScore
 	g.sessionMgr.mu.RUnlock()
 
-	frustResult := g.frustAnal.Score(pState.userMessage, prevFrustration, prevTurnAt, recentMsgs)
-	turn.FrustrationDelta = frustResult.Delta
-	pState.state.session.FrustrationScore = frustResult.Score
-
-	// 2. Hallucination analysis
-	halSignals := g.hallucDet.Analyze(turn)
-	turn.HallucinationRisk = g.hallucDet.AggregateRisk(halSignals)
+	actx := &intelligence.AnalysisContext{
+		Turn:               turn,
+		Session:            pState.state.session,
+		Store:              g.store,
+		PreviousTurnAt:     prevTurnAt,
+		RecentUserMessages: recentMsgs,
+	}
+	g.intelligence.AnalyzeAll(context.Background(), actx)
 
 	// 3. Emit metrics
 	metrics.TurnsTotal.WithLabelValues(string(provider), pState.model).Inc()
 	metrics.TurnLatencyMs.WithLabelValues(string(provider), pState.model).Observe(float64(latency.Milliseconds()))
 	metrics.TokensIn.WithLabelValues(string(provider), pState.model).Add(float64(tokensIn))
 	metrics.TokensOut.WithLabelValues(string(provider), pState.model).Add(float64(tokensOut))
-
-	if g.frustAnal.ShouldAlert(frustResult.Score) {
-		pState.state.session.Outcome = types.OutcomeAbandoned
-	}
 
 	// 4. Persist
 	g.sessionMgr.RecordTurn(pState.state, turn)
@@ -491,7 +492,7 @@ func (g *Gateway) handleInterceptedResponse(resp *http.Response, ctx *goproxy.Pr
 		"session_id", pState.state.session.ID,
 		"provider", provider,
 		"latency_ms", turn.LatencyMs,
-		"frustration", fmt.Sprintf("%.2f", frustResult.Score),
+		"frustration", fmt.Sprintf("%.2f", pState.state.session.FrustrationScore),
 	)
 }
 
@@ -526,7 +527,7 @@ func (g *Gateway) handleModelProxy(upstreamBase string, provider types.Provider)
 		}
 
 		// Extract AgentLens metadata from headers.
-		
+
 		// Drop internal housekeeping requests (like Claude Code title generation)
 		// before they pollute the session tracking system.
 		if sa, ok := adapter.(interface{ ShouldSkip([]byte) bool }); ok {
@@ -613,22 +614,21 @@ func (g *Gateway) handleModelProxy(upstreamBase string, provider types.Provider)
 
 		// ── Run intelligence pipeline ──────────────────────────────────
 
-		// 1. Frustration analysis
+		// ── Run intelligence pipeline ──────────────────────────────────
 		var prevTurnAt *time.Time
 		g.sessionMgr.mu.RLock()
 		prevTurnAt = state.lastTurnAt
 		recentMsgs := append([]string{}, state.recentMessages...)
-		prevFrustration := state.session.FrustrationScore
 		g.sessionMgr.mu.RUnlock()
 
-		frustResult := g.frustAnal.Score(userMessage, prevFrustration, prevTurnAt, recentMsgs)
-		turn.FrustrationDelta = frustResult.Delta
-		state.session.FrustrationScore = frustResult.Score
-
-		// 2. Hallucination analysis (after turn is populated with tool calls from tool proxy)
-		// Note: tool calls are attached when processed via /tools/execute before this response.
-		halSignals := g.hallucDet.Analyze(turn)
-		turn.HallucinationRisk = g.hallucDet.AggregateRisk(halSignals)
+		actx := &intelligence.AnalysisContext{
+			Turn:               turn,
+			Session:            state.session,
+			Store:              g.store,
+			PreviousTurnAt:     prevTurnAt,
+			RecentUserMessages: recentMsgs,
+		}
+		g.intelligence.AnalyzeAll(r.Context(), actx)
 
 		// 3. Emit metrics
 		metrics.TurnsTotal.WithLabelValues(string(provider), model).Inc()
@@ -636,55 +636,15 @@ func (g *Gateway) handleModelProxy(upstreamBase string, provider types.Provider)
 		metrics.TokensIn.WithLabelValues(string(provider), model).Add(float64(tokensIn))
 		metrics.TokensOut.WithLabelValues(string(provider), model).Add(float64(tokensOut))
 
-		for _, sig := range halSignals {
-			metrics.HallucinationSignalsTotal.WithLabelValues(string(sig.Type), string(provider)).Inc()
-			metrics.HallucinationRiskScore.WithLabelValues(string(sig.Type)).Observe(sig.RiskScore)
-		}
-
-		if g.frustAnal.ShouldAlert(frustResult.Score) {
-			for _, trigger := range frustResult.Triggers {
-				metrics.FrustrationEventsTotal.WithLabelValues(string(trigger), string(provider)).Inc()
-			}
-			metrics.FrustrationScore.WithLabelValues(string(provider)).Observe(frustResult.Score)
-		}
-
-		if g.frustAnal.ShouldMarkAbandoned(frustResult.Score) {
-			state.session.Outcome = types.OutcomeAbandoned
-		}
-
-		// 4. Persist turn + signals
+		// 4. Persist turn
 		g.sessionMgr.RecordTurn(state, turn)
-
-		go func() {
-			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			defer cancel()
-			for _, sig := range halSignals {
-				if err := g.store.InsertHallucinationSignal(ctx, sig); err != nil {
-					slog.Error("failed to persist hallucination signal", "err", err)
-				}
-			}
-			if g.frustAnal.ShouldAlert(frustResult.Score) {
-				fe := &types.FrustrationEvent{
-					ID:              uuid.NewString(),
-					SessionID:       sessionID,
-					TurnID:          turnID,
-					Score:           frustResult.Score,
-					Triggers:        frustResult.Triggers,
-					UserMessageSnip: truncate(userMessage, 120),
-					DetectedAt:      time.Now(),
-				}
-				if err := g.store.InsertFrustrationEvent(ctx, fe); err != nil {
-					slog.Error("failed to persist frustration event", "err", err)
-				}
-			}
-		}()
 
 		// Headers are already written by the recorder — nothing more to do.
 		slog.Info("turn processed",
 			"session_id", sessionID,
 			"turn_index", turn.Index,
 			"latency_ms", turn.LatencyMs,
-			"frustration", fmt.Sprintf("%.2f", frustResult.Score),
+			"frustration", fmt.Sprintf("%.2f", state.session.FrustrationScore),
 			"hallucination_risk", fmt.Sprintf("%.2f", turn.HallucinationRisk),
 		)
 	}
@@ -929,6 +889,7 @@ func (r *responseRecorder) Flush() {
 func (r *responseRecorder) Unwrap() http.ResponseWriter {
 	return r.ResponseWriter
 }
+
 // callUpstreamTool makes a POST request to the real tool server.
 func callUpstreamTool(upstreamURL string, params json.RawMessage) (json.RawMessage, error) {
 	resp, err := http.Post(upstreamURL, "application/json", bytes.NewReader(params))
