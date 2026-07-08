@@ -47,8 +47,8 @@ func (s *Store) UpsertSession(ctx context.Context, sess *types.Session) error {
 			id, user_id, agent_id, provider, model,
 			started_at, ended_at, outcome,
 			turn_count, total_tokens_in, total_tokens_out,
-			frustration_score, metadata
-		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+			frustration_score, evaluated_at, metadata
+		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
 		ON CONFLICT (id) DO UPDATE SET
 			ended_at          = EXCLUDED.ended_at,
 			outcome           = EXCLUDED.outcome,
@@ -56,12 +56,13 @@ func (s *Store) UpsertSession(ctx context.Context, sess *types.Session) error {
 			total_tokens_in   = EXCLUDED.total_tokens_in,
 			total_tokens_out  = EXCLUDED.total_tokens_out,
 			frustration_score = EXCLUDED.frustration_score,
+			evaluated_at      = EXCLUDED.evaluated_at,
 			metadata          = EXCLUDED.metadata`,
 		sess.ID, nullString(sess.UserID), sess.AgentID,
 		string(sess.Provider), sess.Model,
 		sess.StartedAt, sess.EndedAt, string(sess.Outcome),
 		sess.TurnCount, sess.TotalTokensIn, sess.TotalTokensOut,
-		sess.FrustrationScore, meta,
+		sess.FrustrationScore, sess.EvaluatedAt, meta,
 	)
 	return err
 }
@@ -72,19 +73,20 @@ func (s *Store) GetSession(ctx context.Context, id string) (*types.Session, erro
 		`SELECT id, user_id, agent_id, provider, model,
 		        started_at, ended_at, outcome,
 		        turn_count, total_tokens_in, total_tokens_out,
-		        frustration_score, metadata
+		        frustration_score, evaluated_at, metadata
 		 FROM sessions WHERE id = $1`, id)
 
 	var sess types.Session
 	var userID sql.NullString
 	var endedAt sql.NullTime
+	var evalAt sql.NullTime
 	var meta []byte
 
 	err := row.Scan(
 		&sess.ID, &userID, &sess.AgentID, &sess.Provider, &sess.Model,
 		&sess.StartedAt, &endedAt, &sess.Outcome,
 		&sess.TurnCount, &sess.TotalTokensIn, &sess.TotalTokensOut,
-		&sess.FrustrationScore, &meta,
+		&sess.FrustrationScore, &evalAt, &meta,
 	)
 	if err != nil {
 		return nil, err
@@ -94,6 +96,9 @@ func (s *Store) GetSession(ctx context.Context, id string) (*types.Session, erro
 	}
 	if endedAt.Valid {
 		sess.EndedAt = &endedAt.Time
+	}
+	if evalAt.Valid {
+		sess.EvaluatedAt = &evalAt.Time
 	}
 	if meta != nil {
 		_ = json.Unmarshal(meta, &sess.Metadata)
@@ -107,7 +112,7 @@ func (s *Store) ListSessions(ctx context.Context, limit int) ([]*types.Session, 
 		`SELECT id, user_id, agent_id, provider, model,
 		        started_at, ended_at, outcome,
 		        turn_count, total_tokens_in, total_tokens_out,
-		        frustration_score, metadata
+		        frustration_score, evaluated_at, metadata
 		 FROM sessions
 		 ORDER BY (SELECT COALESCE(MAX(created_at), sessions.started_at) FROM turns WHERE turns.session_id = sessions.id) DESC
 		 LIMIT $1`, limit)
@@ -121,12 +126,13 @@ func (s *Store) ListSessions(ctx context.Context, limit int) ([]*types.Session, 
 		var sess types.Session
 		var userID sql.NullString
 		var endedAt sql.NullTime
+		var evalAt sql.NullTime
 		var meta []byte
 		if err := rows.Scan(
 			&sess.ID, &userID, &sess.AgentID, &sess.Provider, &sess.Model,
 			&sess.StartedAt, &endedAt, &sess.Outcome,
 			&sess.TurnCount, &sess.TotalTokensIn, &sess.TotalTokensOut,
-			&sess.FrustrationScore, &meta,
+			&sess.FrustrationScore, &evalAt, &meta,
 		); err != nil {
 			return nil, err
 		}
@@ -136,12 +142,95 @@ func (s *Store) ListSessions(ctx context.Context, limit int) ([]*types.Session, 
 		if endedAt.Valid {
 			sess.EndedAt = &endedAt.Time
 		}
+		if evalAt.Valid {
+			sess.EvaluatedAt = &evalAt.Time
+		}
 		if meta != nil {
 			_ = json.Unmarshal(meta, &sess.Metadata)
 		}
 		sessions = append(sessions, &sess)
 	}
 	return sessions, rows.Err()
+}
+
+// GetPendingEvaluations returns sessions that are completed or idle and need evaluation.
+func (s *Store) GetPendingEvaluations(ctx context.Context, limit int) ([]*types.Session, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT id, user_id, agent_id, provider, model,
+		        started_at, ended_at, outcome,
+		        turn_count, total_tokens_in, total_tokens_out,
+		        frustration_score, evaluated_at, metadata
+		 FROM sessions
+		 WHERE evaluated_at IS NULL AND (outcome != 'in_progress' OR 
+		       (SELECT COALESCE(MAX(created_at), sessions.started_at) FROM turns WHERE turns.session_id = sessions.id) < NOW() - INTERVAL '5 minutes')
+		 ORDER BY started_at ASC
+		 LIMIT $1`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var sessions []*types.Session
+	for rows.Next() {
+		var sess types.Session
+		var userID sql.NullString
+		var endedAt sql.NullTime
+		var evalAt sql.NullTime
+		var meta []byte
+		if err := rows.Scan(
+			&sess.ID, &userID, &sess.AgentID, &sess.Provider, &sess.Model,
+			&sess.StartedAt, &endedAt, &sess.Outcome,
+			&sess.TurnCount, &sess.TotalTokensIn, &sess.TotalTokensOut,
+			&sess.FrustrationScore, &evalAt, &meta,
+		); err != nil {
+			return nil, err
+		}
+		if userID.Valid {
+			sess.UserID = userID.String
+		}
+		if endedAt.Valid {
+			sess.EndedAt = &endedAt.Time
+		}
+		if evalAt.Valid {
+			sess.EvaluatedAt = &evalAt.Time
+		}
+		if meta != nil {
+			_ = json.Unmarshal(meta, &sess.Metadata)
+		}
+		sessions = append(sessions, &sess)
+	}
+	return sessions, rows.Err()
+}
+
+// SaveEvaluation saves the LLM's judgement of a session.
+func (s *Store) SaveEvaluation(ctx context.Context, sessionID string, outcome types.OutcomeStatus, frustration float64, hallucinationReason string, evaluationSummary string) error {
+	_, err := s.db.ExecContext(ctx, `
+		UPDATE sessions SET
+			outcome = $2,
+			frustration_score = $3,
+			evaluated_at = NOW(),
+			metadata = COALESCE(metadata, '{}'::jsonb) || jsonb_build_object('evaluation_summary', $4::text)
+		WHERE id = $1`,
+		sessionID, string(outcome), frustration, evaluationSummary,
+	)
+	if err != nil {
+		return err
+	}
+
+	if hallucinationReason != "" {
+		// Attempt to get the last turn ID to attach the signal to
+		var turnID string
+		err := s.db.QueryRowContext(ctx, "SELECT id FROM turns WHERE session_id = $1 ORDER BY turn_index DESC LIMIT 1", sessionID).Scan(&turnID)
+		if err == nil {
+			_, _ = s.db.ExecContext(ctx, `
+				INSERT INTO hallucination_signals (
+					id, session_id, turn_id, signal_type,
+					risk_score, model_claim, actual_value, evidence, detected_at
+				) VALUES (gen_random_uuid(), $1, $2, 'evaluator_audit', 1.0, '', '', $3, NOW())
+			`, sessionID, turnID, hallucinationReason)
+		}
+	}
+	return nil
 }
 
 // ─── Turn ─────────────────────────────────────────────────────────────────
@@ -213,36 +302,48 @@ func (s *Store) ListTurns(ctx context.Context, sessionID string) ([]*types.Turn,
 	return turns, rows.Err()
 }
 
-// ListTimelineTurns returns turns with user and model messages heavily truncated
-// to drastically reduce JSON payload size and browser rendering overhead for the timeline view.
-func (s *Store) ListTimelineTurns(ctx context.Context, sessionID string) ([]*types.Turn, error) {
+// ListTimelineEntries returns a fully populated timeline for a session in a single optimized query.
+func (s *Store) ListTimelineEntries(ctx context.Context, sessionID string) ([]types.TimelineEntry, error) {
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT id, session_id, turn_index,
-		        LEFT(user_message, 250) AS user_message, 
-		        LEFT(model_response, 250) AS model_response, 
-		        thinking_trace,
-		        tokens_in, tokens_out, latency_ms,
-		        frustration_delta, hallucination_risk, created_at
-		 FROM turns WHERE session_id = $1 ORDER BY turn_index ASC`, sessionID)
+		`SELECT t.id, t.session_id, t.turn_index,
+		        LEFT(t.user_message, 250), LEFT(t.model_response, 250), t.thinking_trace,
+		        t.tokens_in, t.tokens_out, t.latency_ms,
+		        t.frustration_delta, t.hallucination_risk, t.created_at,
+		        (SELECT COALESCE(json_agg(row_to_json(tc)), '[]') FROM tool_calls tc WHERE tc.turn_id = t.id) as tool_calls,
+		        (SELECT COALESCE(json_agg(row_to_json(hs)), '[]') FROM hallucination_signals hs WHERE hs.turn_id = t.id) as signals
+		 FROM turns t WHERE t.session_id = $1 ORDER BY t.turn_index ASC`, sessionID)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 
-	var turns []*types.Turn
+	var entries []types.TimelineEntry
 	for rows.Next() {
 		var t types.Turn
+		var toolCallsJSON, signalsJSON []byte
+
 		if err := rows.Scan(
 			&t.ID, &t.SessionID, &t.Index,
 			&t.UserMessage, &t.ModelResponse, &t.ThinkingTrace,
 			&t.TokensIn, &t.TokensOut, &t.LatencyMs,
 			&t.FrustrationDelta, &t.HallucinationRisk, &t.CreatedAt,
+			&toolCallsJSON, &signalsJSON,
 		); err != nil {
 			return nil, err
 		}
-		turns = append(turns, &t)
+
+		var toolCalls []*types.ToolCall
+		var signals []*types.HallucinationSignal
+		_ = json.Unmarshal(toolCallsJSON, &toolCalls)
+		_ = json.Unmarshal(signalsJSON, &signals)
+
+		entries = append(entries, types.TimelineEntry{
+			Turn:      &t,
+			ToolCalls: toolCalls,
+			Signals:   signals,
+		})
 	}
-	return turns, rows.Err()
+	return entries, rows.Err()
 }
 
 // ─── Tool Call ────────────────────────────────────────────────────────────
@@ -396,7 +497,7 @@ func (s *Store) GetAgentHealth(ctx context.Context, agentID string, since time.D
 		WindowEnd:   windowEnd,
 	}
 
-	err := s.db.QueryRowContext(ctx, `
+	query := `
 		SELECT
 			COUNT(*) AS total,
 			COUNT(*) FILTER (WHERE outcome = 'success') AS successful,
@@ -404,15 +505,27 @@ func (s *Store) GetAgentHealth(ctx context.Context, agentID string, since time.D
 			COALESCE(AVG(frustration_score), 0) AS avg_frustration,
 			COALESCE(AVG(turn_count), 0) AS avg_turns
 		FROM sessions
-		WHERE agent_id = $1 AND started_at >= $2`,
-		agentID, windowStart,
-	).Scan(
-		&health.TotalSessions,
-		&health.SuccessfulSessions,
-		&health.AbandonedSessions,
-		&health.AvgFrustrationScore,
-		&health.AvgSessionTurns,
-	)
+		WHERE started_at >= $1`
+
+	var err error
+	if agentID == "global" {
+		err = s.db.QueryRowContext(ctx, query, windowStart).Scan(
+			&health.TotalSessions,
+			&health.SuccessfulSessions,
+			&health.AbandonedSessions,
+			&health.AvgFrustrationScore,
+			&health.AvgSessionTurns,
+		)
+	} else {
+		query += " AND agent_id = $2"
+		err = s.db.QueryRowContext(ctx, query, windowStart, agentID).Scan(
+			&health.TotalSessions,
+			&health.SuccessfulSessions,
+			&health.AbandonedSessions,
+			&health.AvgFrustrationScore,
+			&health.AvgSessionTurns,
+		)
+	}
 	if err != nil {
 		return nil, err
 	}

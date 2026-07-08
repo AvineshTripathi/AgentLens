@@ -19,6 +19,7 @@ import (
 
 	"github.com/AvineshTripathi/AgentLens/internal/config"
 	"github.com/AvineshTripathi/AgentLens/internal/dashboard"
+	"github.com/AvineshTripathi/AgentLens/internal/intelligence"
 	_ "github.com/AvineshTripathi/AgentLens/internal/metrics" // register Prometheus metrics
 	"github.com/AvineshTripathi/AgentLens/internal/proxy"
 	"github.com/AvineshTripathi/AgentLens/internal/store"
@@ -80,6 +81,11 @@ func main() {
 		WriteTimeout: 30 * time.Second,
 	}
 
+	// ── Evaluator Worker ──────────────────────────────────────────────────
+	evalWorker := intelligence.NewEvaluatorWorker(cfg.Evaluator, st)
+	evalCtx, evalCancel := context.WithCancel(context.Background())
+	go evalWorker.Start(evalCtx)
+
 	// ── Start servers ─────────────────────────────────────────────────────
 	go func() {
 		slog.Info("gateway listening", "addr", gwServer.Addr,
@@ -103,6 +109,7 @@ func main() {
 	<-quit
 
 	slog.Info("shutting down...")
+	evalCancel() // stop evaluator worker
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 

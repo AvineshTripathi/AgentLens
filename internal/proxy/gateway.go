@@ -26,6 +26,7 @@ import (
 	"github.com/gorilla/mux"
 
 	"github.com/AvineshTripathi/AgentLens/internal/config"
+	"github.com/AvineshTripathi/AgentLens/internal/events"
 	"github.com/AvineshTripathi/AgentLens/internal/intelligence"
 	"github.com/AvineshTripathi/AgentLens/internal/metrics"
 	"github.com/AvineshTripathi/AgentLens/internal/proxy/providers"
@@ -207,6 +208,8 @@ func (sm *SessionManager) RecordTurn(state *sessionState, turn *types.Turn) {
 		if err := sm.store.UpsertSession(ctx, state.session); err != nil {
 			slog.Error("failed to update session", "session_id", state.session.ID, "err", err)
 		}
+		// Notify dashboard clients that this session has new data.
+		events.Publish("session", state.session.ID)
 	}()
 }
 
@@ -365,6 +368,12 @@ func (g *Gateway) handleInterceptedRequest(req *http.Request, ctx *goproxy.Proxy
 		}
 	}
 	agentID := req.Header.Get("X-AgentLens-Agent-ID")
+	if agentID == "" {
+		agentID = req.URL.Query().Get("agent_id")
+	}
+	if agentID == "" {
+		agentID = req.URL.Query().Get("agent")
+	}
 	if agentID == "" {
 		agentID = "unknown"
 	}
@@ -558,6 +567,12 @@ func (g *Gateway) handleModelProxy(upstreamBase string, provider types.Provider)
 			}
 		}
 		agentID := r.Header.Get("X-AgentLens-Agent-ID")
+		if agentID == "" {
+			agentID = r.URL.Query().Get("agent_id")
+		}
+		if agentID == "" {
+			agentID = r.URL.Query().Get("agent")
+		}
 		if agentID == "" {
 			agentID = "unknown"
 		}

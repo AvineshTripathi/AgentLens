@@ -14,6 +14,7 @@ type Config struct {
 	Storage   StorageConfig   `yaml:"storage"`
 	Telemetry TelemetryConfig `yaml:"telemetry"`
 	Proxy     ProxyConfig     `yaml:"proxy"`
+	Evaluator EvaluatorConfig `yaml:"evaluator"`
 }
 
 // ServerConfig holds HTTP server settings.
@@ -56,6 +57,15 @@ type TelemetryConfig struct {
 	PrometheusPort int    `yaml:"prometheus_port"`
 }
 
+// EvaluatorConfig holds settings for the LLM judge.
+type EvaluatorConfig struct {
+	Enabled         bool   `yaml:"enabled"`
+	APIBase         string `yaml:"api_base"`
+	APIKey          string `yaml:"api_key"`
+	Model           string `yaml:"model"`
+	IntervalSeconds int    `yaml:"interval_seconds"`
+}
+
 // Default returns a configuration with sensible defaults.
 func Default() *Config {
 	return &Config{
@@ -71,6 +81,13 @@ func Default() *Config {
 			PrometheusPort: 9091,
 		},
 		Proxy: DefaultProxyConfig(),
+		Evaluator: EvaluatorConfig{
+			Enabled:         true,
+			APIBase:         "https://generativelanguage.googleapis.com/v1beta/openai",
+			APIKey:          "",
+			Model:           "gemini-1.5-flash",
+			IntervalSeconds: 60,
+		},
 	}
 }
 
@@ -100,6 +117,9 @@ func Load(path string) (*Config, error) {
 	}
 	if otlp := os.Getenv("AGENTLENS_OTLP_ENDPOINT"); otlp != "" {
 		cfg.Telemetry.OTLPEndpoint = otlp
+	}
+	if evalKey := os.Getenv("AGENTLENS_EVALUATOR_API_KEY"); evalKey != "" {
+		cfg.Evaluator.APIKey = evalKey
 	}
 
 	return cfg, nil

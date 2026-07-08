@@ -11,8 +11,8 @@ import (
 	"github.com/gorilla/mux"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 
+	"github.com/AvineshTripathi/AgentLens/internal/events"
 	"github.com/AvineshTripathi/AgentLens/internal/store"
-	"github.com/AvineshTripathi/AgentLens/internal/types"
 )
 
 // Server serves the dashboard UI and REST API.
@@ -112,50 +112,15 @@ func (s *Server) listSignals(w http.ResponseWriter, r *http.Request) {
 	jsonOK(w, signals)
 }
 
-// TimelineEntry combines a turn with its tool calls and signals for the timeline view.
-type TimelineEntry struct {
-	Turn      *types.Turn                  `json:"turn"`
-	ToolCalls []*types.ToolCall            `json:"tool_calls"`
-	Signals   []*types.HallucinationSignal `json:"signals"`
-}
-
 func (s *Server) getTimeline(w http.ResponseWriter, r *http.Request) {
 	id := mux.Vars(r)["id"]
 
-	turns, err := s.store.ListTimelineTurns(r.Context(), id)
-	if err != nil {
-		jsonError(w, err, http.StatusInternalServerError)
-		return
-	}
-	calls, err := s.store.ListToolCalls(r.Context(), id)
-	if err != nil {
-		jsonError(w, err, http.StatusInternalServerError)
-		return
-	}
-	signals, err := s.store.ListHallucinationSignals(r.Context(), id)
+	entries, err := s.store.ListTimelineEntries(r.Context(), id)
 	if err != nil {
 		jsonError(w, err, http.StatusInternalServerError)
 		return
 	}
 
-	// Group calls and signals by turn ID.
-	callsByTurn := map[string][]*types.ToolCall{}
-	for _, c := range calls {
-		callsByTurn[c.TurnID] = append(callsByTurn[c.TurnID], c)
-	}
-	sigsByTurn := map[string][]*types.HallucinationSignal{}
-	for _, sig := range signals {
-		sigsByTurn[sig.TurnID] = append(sigsByTurn[sig.TurnID], sig)
-	}
-
-	entries := make([]TimelineEntry, 0, len(turns))
-	for _, t := range turns {
-		entries = append(entries, TimelineEntry{
-			Turn:      t,
-			ToolCalls: callsByTurn[t.ID],
-			Signals:   sigsByTurn[t.ID],
-		})
-	}
 	jsonOK(w, entries)
 }
 
@@ -184,21 +149,27 @@ func (s *Server) sseStream(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
-	w.Header().Set("Access-Control-Allow-Origin", "*")
 
 	flusher, ok := w.(http.Flusher)
 	if !ok {
-		http.Error(w, "streaming not supported", http.StatusInternalServerError)
+		http.Error(w, "Streaming unsupported!", http.StatusInternalServerError)
 		return
 	}
 
+	ctx := r.Context()
 	ticker := time.NewTicker(15 * time.Second)
 	defer ticker.Stop()
 
+	sub := events.Subscribe()
+	defer events.Unsubscribe(sub)
+
 	for {
 		select {
-		case <-r.Context().Done():
+		case <-ctx.Done():
 			return
+		case msg := <-sub:
+			fmt.Fprint(w, msg)
+			flusher.Flush()
 		case t := <-ticker.C:
 			fmt.Fprintf(w, "event: ping\ndata: %s\n\n", t.Format(time.RFC3339))
 			flusher.Flush()

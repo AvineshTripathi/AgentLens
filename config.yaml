@@ -13,3 +13,10 @@ proxy:
 telemetry:
   otlp_endpoint: "http://localhost:4318"   # Jaeger / any OTLP collector
   prometheus_port: 9091
+
+evaluator:
+  enabled: true
+  api_base: "https://generativelanguage.googleapis.com/v1beta/openai"
+  api_key: ""            # Or set AGENTLENS_EVALUATOR_API_KEY
+  model: "gemini-3.1-flash-lite"                 # Model name to use for judging
+  interval_seconds: 60                    # How often the background worker runs

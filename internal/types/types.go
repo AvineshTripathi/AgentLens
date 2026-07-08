@@ -61,6 +61,7 @@ type Session struct {
 	TotalTokensIn    int               `json:"total_tokens_in"`
 	TotalTokensOut   int               `json:"total_tokens_out"`
 	FrustrationScore float64           `json:"frustration_score"` // 0.0 (calm) → 1.0 (rage)
+	EvaluatedAt      *time.Time        `json:"evaluated_at,omitempty"`
 	Metadata         map[string]string `json:"metadata,omitempty"`
 }
 
@@ -251,4 +252,13 @@ type ProxyResponse struct {
 	FrustrationScore  float64               `json:"frustration_score"`
 	HallucinationRisk float64               `json:"hallucination_risk"`
 	Signals           []HallucinationSignal `json:"signals,omitempty"`
+}
+
+// ─── Timeline Entry ───────────────────────────────────────────────────────
+
+// TimelineEntry combines a turn with its associated tool calls and signals.
+type TimelineEntry struct {
+	Turn      *Turn                  `json:"turn"`
+	ToolCalls []*ToolCall            `json:"tool_calls"`
+	Signals   []*HallucinationSignal `json:"signals"`
 }

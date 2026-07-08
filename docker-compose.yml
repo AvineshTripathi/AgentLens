@@ -10,6 +10,7 @@ services:
     environment:
       AGENTLENS_POSTGRES_DSN: "postgres://agentlens:agentlens@postgres:5432/agentlens?sslmode=disable"
       AGENTLENS_OTLP_ENDPOINT: "http://otel-collector:4318"
+      AGENTLENS_EVALUATOR_API_KEY: "${AGENTLENS_EVALUATOR_API_KEY:-}"
     depends_on:
       postgres:
         condition: service_healthy
