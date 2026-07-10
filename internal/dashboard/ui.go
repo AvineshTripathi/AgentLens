@@ -410,6 +410,7 @@ function renderSessionTable(containerId) {
 async function openSession(id) {
   currentSessionID = id;
   nav('session-detail');
+  document.getElementById('sd-timeline').innerHTML = '';
   
   const s = allSessions.find(x => x.id === id);
   if(s) {
@@ -496,13 +497,15 @@ function renderTimeline(entries) {
     // Signals
     let sigsHtml = '';
     if (e.signals && e.signals.length) {
-      sigsHtml = e.signals.map(sig => ` + "`" + `
-        <div class="signal-card">
-          <div class="signal-title">🚨 Hallucination Detected: ${sig.type.replace('_',' ')}</div>
-          <div>Claim: ${sig.model_claim}</div>
-          <div>Actual: ${sig.actual_value}</div>
-        </div>
-      ` + "`" + `).join('');
+      sigsHtml = e.signals.map(sig => {
+        let h = '<div class="signal-card">';
+        h += '<div class="signal-title">🚨 Hallucination Detected: ' + (sig.type ? sig.type.replace('_',' ') : '') + '</div>';
+        if (sig.model_claim) h += '<div>Claim: ' + sig.model_claim + '</div>';
+        if (sig.actual_value) h += '<div>Actual: ' + sig.actual_value + '</div>';
+        if (sig.evidence) h += '<div>Evidence: ' + escapeHTML(sig.evidence) + '</div>';
+        h += '</div>';
+        return h;
+      }).join('');
     }
     
     updateOrCreateTurn(t, toolsHtml, sigsHtml);

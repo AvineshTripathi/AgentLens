@@ -57,7 +57,7 @@ func (s *Store) UpsertSession(ctx context.Context, sess *types.Session) error {
 			total_tokens_out  = EXCLUDED.total_tokens_out,
 			frustration_score = EXCLUDED.frustration_score,
 			evaluated_at      = EXCLUDED.evaluated_at,
-			metadata          = EXCLUDED.metadata`,
+			metadata          = CASE WHEN EXCLUDED.metadata IS NULL OR EXCLUDED.metadata::text = 'null' THEN sessions.metadata ELSE EXCLUDED.metadata END`,
 		sess.ID, nullString(sess.UserID), sess.AgentID,
 		string(sess.Provider), sess.Model,
 		sess.StartedAt, sess.EndedAt, string(sess.Outcome),
@@ -162,7 +162,7 @@ func (s *Store) GetPendingEvaluations(ctx context.Context, limit int) ([]*types.
 		        frustration_score, evaluated_at, metadata
 		 FROM sessions
 		 WHERE evaluated_at IS NULL AND (outcome != 'in_progress' OR 
-		       (SELECT COALESCE(MAX(created_at), sessions.started_at) FROM turns WHERE turns.session_id = sessions.id) < NOW() - INTERVAL '5 minutes')
+		       (SELECT COALESCE(MAX(created_at), sessions.started_at) FROM turns WHERE turns.session_id = sessions.id) < NOW() - INTERVAL '1 minute')
 		 ORDER BY started_at ASC
 		 LIMIT $1`, limit)
 	if err != nil {

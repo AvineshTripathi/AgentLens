@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"log/slog"
 	"net/http"
 	"net/http/httputil"
@@ -148,6 +149,12 @@ func (sm *SessionManager) GetOrCreate(sessionID, continuationID, agentID string,
 		session:      sess,
 		lastActiveAt: time.Now(),
 	}
+	slog.Info("new session created",
+		"session_id", sessionID,
+		"provider", provider,
+		"model", model,
+		"agent_id", agentID,
+	)
 	sm.sessions[sessionID] = state
 	sm.rootIndex[sessionID] = sessionID
 	if continuationID != "" {
@@ -280,7 +287,8 @@ func (g *Gateway) routes() {
 }
 
 func (g *Gateway) setupForwardProxy() {
-	g.forward.Verbose = true
+	g.forward.Verbose = false
+	g.forward.Logger = log.New(io.Discard, "", 0)
 
 	// Attempt to load local CA
 	homeDir, err := os.UserHomeDir()
@@ -316,9 +324,11 @@ func (g *Gateway) setupForwardProxy() {
 		// Look up the right adapter by path first, then host.
 		adapter := g.registry.Find(host, path)
 		if adapter == nil {
+			slog.Debug("gateway: passing through unrecognized host", "host", host, "path", path)
 			return req, nil
 		}
 
+		slog.Debug("gateway: intercepting LLM request", "method", req.Method, "host", host, "path", path, "provider", adapter.Provider())
 		g.handleInterceptedRequest(req, ctx, adapter)
 		return req, nil
 	})
@@ -450,7 +460,7 @@ func (g *Gateway) handleInterceptedResponse(resp *http.Response, ctx *goproxy.Pr
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
 			if err := g.store.UpdateTurn(ctx, prevTurn); err != nil {
-				slog.Error("failed to update turn", "err", err)
+				slog.Error("failed to update turn", "session_id", pState.state.session.ID, "turn_id", prevTurn.ID, "err", err)
 			}
 		}()
 
@@ -499,7 +509,10 @@ func (g *Gateway) handleInterceptedResponse(resp *http.Response, ctx *goproxy.Pr
 
 	slog.Info("mitm turn processed",
 		"session_id", pState.state.session.ID,
+		"turn_index", turn.Index,
 		"provider", provider,
+		"tokens_in", turn.TokensIn,
+		"tokens_out", turn.TokensOut,
 		"latency_ms", turn.LatencyMs,
 		"frustration", fmt.Sprintf("%.2f", pState.state.session.FrustrationScore),
 	)
@@ -534,6 +547,8 @@ func (g *Gateway) handleModelProxy(upstreamBase string, provider types.Provider)
 				adapter = &providers.GeminiAdapter{}
 			}
 		}
+
+		slog.Debug("gateway: proxying LLM request", "method", r.Method, "host", r.Host, "path", r.URL.Path, "provider", provider)
 
 		// Extract AgentLens metadata from headers.
 
@@ -658,6 +673,9 @@ func (g *Gateway) handleModelProxy(upstreamBase string, provider types.Provider)
 		slog.Info("turn processed",
 			"session_id", sessionID,
 			"turn_index", turn.Index,
+			"provider", provider,
+			"tokens_in", turn.TokensIn,
+			"tokens_out", turn.TokensOut,
 			"latency_ms", turn.LatencyMs,
 			"frustration", fmt.Sprintf("%.2f", state.session.FrustrationScore),
 			"hallucination_risk", fmt.Sprintf("%.2f", turn.HallucinationRisk),

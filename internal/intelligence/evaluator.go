@@ -67,6 +67,7 @@ func (w *EvaluatorWorker) runEvaluationCycle(ctx context.Context) {
 			slog.Error("Failed to evaluate session", "session_id", sess.ID, "err", err)
 			continue
 		}
+		slog.Info("Session evaluated successfully", "session_id", sess.ID)
 	}
 }
 

@@ -174,34 +174,6 @@ func cleanForDisplay(text string) string {
 // Solution: extract only the human-authored text from the first user message,
 // strip all known dynamic injection patterns, then hash the result.
 func (a *AnthropicAdapter) ExtractSessionID(body []byte) string {
-	messages := parseAnthropicMessages(body)
-	if len(messages) == 0 {
-		return ""
-	}
-
-	// Find the first message with role "user" (always messages[0] in practice).
-	for _, m := range messages {
-		if m.Role != "user" {
-			continue
-		}
-		rawText := extractPlainText(m.Content)
-		anchor := normaliseForHash(rawText)
-		if anchor == "" {
-			// The first user message is entirely injected context (e.g. pure tool result).
-			// Fall through to try subsequent user messages — extremely rare.
-			continue
-		}
-
-		sID := uuid.NewMD5(uuid.NameSpaceOID, []byte("anthropic:v2:"+anchor)).String()
-		slog.Debug("anthropic: session ID computed",
-			"anchor_preview", anchor[:min(60, len(anchor))],
-			"session_id", sID,
-			"total_messages", len(messages),
-		)
-		return sID
-	}
-
-	slog.Debug("anthropic: no anchor found for session ID")
 	return ""
 }
 

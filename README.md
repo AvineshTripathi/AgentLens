@@ -16,38 +16,33 @@ AgentLens natively supports:
 - **Frustration Analyzer:** Scores user frustration based on behavioral (e.g. rage prompting) and linguistic signals.
 - **Real-time Dashboard:** A built-in dashboard showing a complete timeline of every session.
 
-## Running Locally
+## Installation (One-Click)
 
-You can run the entire AgentLens stack locally using Docker Compose.
+AgentLens comes with an automated installer that will set up Docker Compose, generate your local SSL certificates, and install the `lens` CLI wrapper.
 
-### 1. Start the stack
-Run the following command in the root of the project to build the proxy, generate local CA certificates, and start all services via Docker:
 ```bash
-make deploy
+./install.sh
 ```
-This will start:
+
+This will automatically spin up:
 - **AgentLens Gateway:** `http://localhost:8080`
 - **AgentLens Dashboard:** `http://localhost:8090`
 - **PostgreSQL:** `localhost:5432` 
 
-### 2. View the Dashboard
-Open your browser and navigate to:
-**http://localhost:8090**
+Open your browser and navigate to **http://localhost:8090** to view the dashboard!
 
-## How to Use (Routing Traffic)
+## Usage (`lens` wrapper)
 
-To use AgentLens with your CLI agents, you can route all traffic through the proxy globally by setting standard proxy environment variables and telling your runtimes to trust the AgentLens certificate.
+Instead of manually exporting global proxy variables and polluting your terminal environment, AgentLens installs a lightweight wrapper command called `lens`. 
+
+Simply prepend `lens` to whatever agent command you want to run. It dynamically injects the proxy settings **only** for that specific execution, ensuring that all other background terminal traffic remains completely unaffected.
 
 ```bash
-export HTTP_PROXY="http://localhost:8080"
-export HTTPS_PROXY="http://localhost:8080"
-export NODE_EXTRA_CA_CERTS="$HOME/.agentlens/ca.crt"
-export REQUESTS_CA_BUNDLE="$HOME/.agentlens/ca.crt"
-
-# Now run your agent normally!
-claude
+lens claude
 # or
-agy
+lens agy
+# or
+lens python my_agent.py
 ```
 
 ## Architecture Overview

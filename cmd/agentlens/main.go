@@ -54,7 +54,7 @@ func main() {
 		os.Exit(1)
 	}
 	defer st.Close()
-	slog.Info("connected to postgres")
+	slog.Info("connected to postgres", "dsn", "postgres://***:***@localhost:5432/agentlens")
 
 	// ── Run migrations ────────────────────────────────────────────────────
 	if err := runMigrations(st); err != nil {
