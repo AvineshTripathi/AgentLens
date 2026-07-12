@@ -53,7 +53,7 @@ Simply prepend `lens` to whatever agent command you want to run. It dynamically 
 lens claude
 # or
 lens agy
-# or
+# or (alpha)
 lens python my_agent.py
 ```
 
