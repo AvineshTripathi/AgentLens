@@ -41,7 +41,12 @@ func (s *Store) Close() error { return s.db.Close() }
 
 // UpsertSession inserts or updates a session record.
 func (s *Store) UpsertSession(ctx context.Context, sess *types.Session) error {
-	meta, _ := json.Marshal(sess.Metadata)
+	var meta interface{}
+	if sess.Metadata != nil {
+		if b, err := json.Marshal(sess.Metadata); err == nil {
+			meta = b
+		}
+	}
 	_, err := s.db.ExecContext(ctx, `
 		INSERT INTO sessions (
 			id, user_id, agent_id, provider, model,

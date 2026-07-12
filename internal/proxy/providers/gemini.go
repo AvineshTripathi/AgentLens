@@ -21,6 +21,8 @@ func (a *GeminiAdapter) Domains() []string {
 		"generativelanguage.googleapis.com",
 		"daily-cloudcode-pa.googleapis.com",
 		"antigravity-unleash.goog",
+		"www.googleapis.com",
+		"googleusercontent.com",
 	}
 }
 
@@ -244,18 +246,45 @@ func (a *GeminiAdapter) ExtractModelResponse(body []byte) string {
 }
 
 func (a *GeminiAdapter) ExtractTokenCounts(body []byte) (int, int) {
-	var obj map[string]json.RawMessage
-	if err := json.Unmarshal(body, &obj); err != nil {
-		return 0, 0
-	}
-	// Try root usageMetadata
-	if raw, ok := obj["usageMetadata"]; ok {
-		var usage struct {
-			PromptTokenCount     int `json:"promptTokenCount"`
-			CandidatesTokenCount int `json:"candidatesTokenCount"`
+	bodyStr := string(body)
+	if strings.Contains(bodyStr, "data: ") {
+		var in, out int
+		for _, line := range strings.Split(bodyStr, "\n") {
+			line = strings.TrimSpace(line)
+			if !strings.HasPrefix(line, "data: ") {
+				continue
+			}
+			jsonStr := strings.TrimPrefix(line, "data: ")
+			if jsonStr == "[DONE]" {
+				continue
+			}
+			var obj map[string]json.RawMessage
+			if err := json.Unmarshal([]byte(jsonStr), &obj); err == nil {
+				if raw, ok := obj["usageMetadata"]; ok {
+					var usage struct {
+						PromptTokenCount     int `json:"promptTokenCount"`
+						CandidatesTokenCount int `json:"candidatesTokenCount"`
+					}
+					if err := json.Unmarshal(raw, &usage); err == nil {
+						in = usage.PromptTokenCount
+						out = usage.CandidatesTokenCount
+					}
+				}
+			}
 		}
-		if err := json.Unmarshal(raw, &usage); err == nil {
-			return usage.PromptTokenCount, usage.CandidatesTokenCount
+		return in, out
+	}
+
+	var obj map[string]json.RawMessage
+	if err := json.Unmarshal(body, &obj); err == nil {
+		if raw, ok := obj["usageMetadata"]; ok {
+			var usage struct {
+				PromptTokenCount     int `json:"promptTokenCount"`
+				CandidatesTokenCount int `json:"candidatesTokenCount"`
+			}
+			if err := json.Unmarshal(raw, &usage); err == nil {
+				return usage.PromptTokenCount, usage.CandidatesTokenCount
+			}
 		}
 	}
 	return 0, 0

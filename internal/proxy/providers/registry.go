@@ -49,7 +49,7 @@ func (r *Registry) MITMRegex() string {
 	for _, d := range r.AllDomains() {
 		escaped = append(escaped, strings.ReplaceAll(d, ".", "\\."))
 	}
-	return fmt.Sprintf(`^(%s)(:[0-9]+)?$`, strings.Join(escaped, "|"))
+	return fmt.Sprintf(`^(.*\.)?(%s)(:[0-9]+)?$`, strings.Join(escaped, "|"))
 }
 
 // FindByHost returns the adapter that claims the given hostname, or nil.

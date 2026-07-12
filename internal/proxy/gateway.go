@@ -413,6 +413,113 @@ func (g *Gateway) handleInterceptedRequest(req *http.Request, ctx *goproxy.Proxy
 	}
 }
 
+type trackingReader struct {
+	io.ReadCloser
+	buf    bytes.Buffer
+	g      *Gateway
+	pState *proxyState
+}
+
+func (r *trackingReader) Read(p []byte) (n int, err error) {
+	n, err = r.ReadCloser.Read(p)
+	if n > 0 {
+		if r.buf.Len()+n <= 5<<20 {
+			r.buf.Write(p[:n])
+		}
+	}
+	return n, err
+}
+
+func (r *trackingReader) Close() error {
+	err := r.ReadCloser.Close()
+
+	bodyBytes := r.buf.Bytes()
+	latency := time.Since(r.pState.start)
+	modelResponse := r.pState.adapter.ExtractModelResponse(bodyBytes)
+	tokensIn, tokensOut := r.pState.adapter.ExtractTokenCounts(bodyBytes)
+	provider := r.pState.adapter.Provider()
+
+	// ── Duplicate Turn (Tool Loop) Detection ──────────────────────
+	var prevTurn *types.Turn
+	r.g.sessionMgr.mu.RLock()
+	if len(r.pState.state.turns) > 0 {
+		prevTurn = r.pState.state.turns[len(r.pState.state.turns)-1]
+	}
+	r.g.sessionMgr.mu.RUnlock()
+
+	isToolLoop := false
+	if prevTurn != nil && r.pState.userMessage != "" && r.pState.userMessage == prevTurn.UserMessage {
+		if time.Since(prevTurn.CreatedAt) < 30*time.Second {
+			isToolLoop = true
+		}
+	}
+
+	if isToolLoop {
+		prevTurn.ModelResponse = modelResponse
+		prevTurn.TokensIn += tokensIn
+		prevTurn.TokensOut += tokensOut
+		prevTurn.LatencyMs += int(latency.Milliseconds())
+
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			if err := r.g.store.UpdateTurn(ctx, prevTurn); err != nil {
+				slog.Error("failed to update turn", "session_id", r.pState.state.session.ID, "turn_id", prevTurn.ID, "err", err)
+			}
+		}()
+
+		slog.Info("tool loop turn aggregated", "session_id", r.pState.state.session.ID, "turn_id", prevTurn.ID)
+		return err
+	}
+
+	turnID := uuid.NewString()
+	turn := &types.Turn{
+		ID:            turnID,
+		SessionID:     r.pState.state.session.ID,
+		Index:         r.pState.state.session.TurnCount,
+		UserMessage:   r.pState.userMessage,
+		ModelResponse: modelResponse,
+		TokensIn:      tokensIn,
+		TokensOut:     tokensOut,
+		LatencyMs:     int(latency.Milliseconds()),
+		CreatedAt:     r.pState.start,
+	}
+
+	var prevTurnAt *time.Time
+	r.g.sessionMgr.mu.RLock()
+	prevTurnAt = r.pState.state.lastTurnAt
+	recentMsgs := append([]string{}, r.pState.state.recentMessages...)
+	r.g.sessionMgr.mu.RUnlock()
+
+	actx := &intelligence.AnalysisContext{
+		Turn:               turn,
+		Session:            r.pState.state.session,
+		Store:              r.g.store,
+		PreviousTurnAt:     prevTurnAt,
+		RecentUserMessages: recentMsgs,
+	}
+	r.g.intelligence.AnalyzeAll(context.Background(), actx)
+
+	metrics.TurnsTotal.WithLabelValues(string(provider), r.pState.model).Inc()
+	metrics.TurnLatencyMs.WithLabelValues(string(provider), r.pState.model).Observe(float64(latency.Milliseconds()))
+	metrics.TokensIn.WithLabelValues(string(provider), r.pState.model).Add(float64(tokensIn))
+	metrics.TokensOut.WithLabelValues(string(provider), r.pState.model).Add(float64(tokensOut))
+
+	r.g.sessionMgr.RecordTurn(r.pState.state, turn)
+
+	slog.Info("mitm turn processed",
+		"session_id", r.pState.state.session.ID,
+		"turn_index", turn.Index,
+		"provider", provider,
+		"tokens_in", turn.TokensIn,
+		"tokens_out", turn.TokensOut,
+		"latency_ms", turn.LatencyMs,
+		"frustration", fmt.Sprintf("%.2f", r.pState.state.session.FrustrationScore),
+	)
+
+	return err
+}
+
 func (g *Gateway) handleInterceptedResponse(resp *http.Response, ctx *goproxy.ProxyCtx) {
 	if resp == nil || resp.Body == nil {
 		return
@@ -422,100 +529,11 @@ func (g *Gateway) handleInterceptedResponse(resp *http.Response, ctx *goproxy.Pr
 		return
 	}
 
-	bodyBytes, err := io.ReadAll(io.LimitReader(resp.Body, 5<<20)) // 5 MB limit
-	if err == nil {
-		resp.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+	resp.Body = &trackingReader{
+		ReadCloser: resp.Body,
+		g:          g,
+		pState:     pState,
 	}
-
-	latency := time.Since(pState.start)
-	modelResponse := pState.adapter.ExtractModelResponse(bodyBytes)
-	tokensIn, tokensOut := pState.adapter.ExtractTokenCounts(bodyBytes)
-	provider := pState.adapter.Provider()
-
-	// ── Duplicate Turn (Tool Loop) Detection ──────────────────────
-	var prevTurn *types.Turn
-	g.sessionMgr.mu.RLock()
-	if len(pState.state.turns) > 0 {
-		prevTurn = pState.state.turns[len(pState.state.turns)-1]
-	}
-	g.sessionMgr.mu.RUnlock()
-
-	isToolLoop := false
-	if prevTurn != nil && pState.userMessage != "" && pState.userMessage == prevTurn.UserMessage {
-		// If exact same user message within 30 seconds, it's almost certainly a tool loop step.
-		if time.Since(prevTurn.CreatedAt) < 30*time.Second {
-			isToolLoop = true
-		}
-	}
-
-	if isToolLoop {
-		// Update the previous turn instead of creating a new one
-		prevTurn.ModelResponse = modelResponse
-		prevTurn.TokensIn += tokensIn
-		prevTurn.TokensOut += tokensOut
-		prevTurn.LatencyMs += int(latency.Milliseconds())
-
-		// Persist update in background
-		go func() {
-			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			defer cancel()
-			if err := g.store.UpdateTurn(ctx, prevTurn); err != nil {
-				slog.Error("failed to update turn", "session_id", pState.state.session.ID, "turn_id", prevTurn.ID, "err", err)
-			}
-		}()
-
-		slog.Info("tool loop turn aggregated", "session_id", pState.state.session.ID, "turn_id", prevTurn.ID)
-		return
-	}
-
-	// Build a new turn.
-	turnID := uuid.NewString()
-	turn := &types.Turn{
-		ID:            turnID,
-		SessionID:     pState.state.session.ID,
-		Index:         pState.state.session.TurnCount,
-		UserMessage:   pState.userMessage,
-		ModelResponse: modelResponse,
-		TokensIn:      tokensIn,
-		TokensOut:     tokensOut,
-		LatencyMs:     int(latency.Milliseconds()),
-		CreatedAt:     pState.start,
-	}
-
-	// ── Run intelligence pipeline ──────────────────────────────────
-	var prevTurnAt *time.Time
-	g.sessionMgr.mu.RLock()
-	prevTurnAt = pState.state.lastTurnAt
-	recentMsgs := append([]string{}, pState.state.recentMessages...)
-	g.sessionMgr.mu.RUnlock()
-
-	actx := &intelligence.AnalysisContext{
-		Turn:               turn,
-		Session:            pState.state.session,
-		Store:              g.store,
-		PreviousTurnAt:     prevTurnAt,
-		RecentUserMessages: recentMsgs,
-	}
-	g.intelligence.AnalyzeAll(context.Background(), actx)
-
-	// 3. Emit metrics
-	metrics.TurnsTotal.WithLabelValues(string(provider), pState.model).Inc()
-	metrics.TurnLatencyMs.WithLabelValues(string(provider), pState.model).Observe(float64(latency.Milliseconds()))
-	metrics.TokensIn.WithLabelValues(string(provider), pState.model).Add(float64(tokensIn))
-	metrics.TokensOut.WithLabelValues(string(provider), pState.model).Add(float64(tokensOut))
-
-	// 4. Persist
-	g.sessionMgr.RecordTurn(pState.state, turn)
-
-	slog.Info("mitm turn processed",
-		"session_id", pState.state.session.ID,
-		"turn_index", turn.Index,
-		"provider", provider,
-		"tokens_in", turn.TokensIn,
-		"tokens_out", turn.TokensOut,
-		"latency_ms", turn.LatencyMs,
-		"frustration", fmt.Sprintf("%.2f", pState.state.session.FrustrationScore),
-	)
 }
 
 // ─── Model Proxy ──────────────────────────────────────────────────────────
